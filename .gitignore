@@ -1,26 +1,19 @@
 # Virtual environment
 venv/
 
-# API keys and environment variables
-.env
-
 # Python cache
 __pycache__/
 *.pyc
 
-# Downloaded SEC data
+# Environment variables / secrets
+.env
+
+# SEC downloaded data
 data/raw/
 data/processed/
-
-# Vector database
-chroma_db/
-
-# VS Code
-.vscode/
 
 # Jupyter
 .ipynb_checkpoints/
 
-# OS files
-.DS_Store
-Thumbs.db
+# Logs
+*.log
