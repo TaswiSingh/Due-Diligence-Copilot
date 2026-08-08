@@ -17,3 +17,6 @@ data/processed/
 
 # Logs
 *.log
+
+# Generated embeddings
+data/processed/*.npy
