@@ -1,5 +1,6 @@
 from pathlib import Path
 from bs4 import BeautifulSoup
+import re
 
 
 # --------------------------------------------------
@@ -21,18 +22,27 @@ if not input_file.exists():
 
 
 # --------------------------------------------------
-# Read the HTML file
+# Read HTML
 # --------------------------------------------------
 
 html = input_file.read_text(
     encoding="utf-8"
 )
 
+# Fix common encoding artifacts
+html = html.replace("â€™", "’")
+html = html.replace("â€œ", "“")
+html = html.replace("â€", "”")
+html = html.replace("â€”", "—")
+html = html.replace("â€“", "–")
+html = html.replace("â˜’", "☒")
+html = html.replace("â˜", "☐")
+
 print("HTML characters:", len(html))
 
 
 # --------------------------------------------------
-# Parse HTML using BeautifulSoup
+# Parse HTML
 # --------------------------------------------------
 
 soup = BeautifulSoup(
@@ -42,15 +52,58 @@ soup = BeautifulSoup(
 
 
 # --------------------------------------------------
-# Remove elements that don't contain useful text
+# Remove unnecessary HTML/XBRL elements
 # --------------------------------------------------
 
-for element in soup(["script", "style", "noscript"]):
-    element.decompose()
+tags_to_remove = [
+    "script",
+    "style",
+    "noscript",
+    "meta",
+    "link",
+    "title",
+]
+
+for tag in soup.find_all(tags_to_remove):
+    tag.decompose()
 
 
 # --------------------------------------------------
-# Extract text
+# Remove Inline XBRL metadata/header
+# --------------------------------------------------
+
+for tag in soup.find_all():
+    tag_name = tag.name.lower() if tag.name else ""
+
+    if tag_name in [
+        "ix:header",
+        "ix:hidden",
+    ]:
+        tag.decompose()
+
+
+# --------------------------------------------------
+# Remove hidden elements
+# --------------------------------------------------
+
+for tag in soup.find_all():
+
+    if tag.has_attr("hidden"):
+        tag.decompose()
+        continue
+
+    style = tag.get("style", "")
+
+    if "display:none" in style.replace(" ", "").lower():
+        tag.decompose()
+        continue
+
+    if "visibility:hidden" in style.replace(" ", "").lower():
+        tag.decompose()
+
+
+# --------------------------------------------------
+# Extract visible text
 # --------------------------------------------------
 
 text = soup.get_text(
@@ -59,7 +112,7 @@ text = soup.get_text(
 
 
 # --------------------------------------------------
-# Clean the extracted text
+# Clean whitespace
 # --------------------------------------------------
 
 lines = []
@@ -68,15 +121,24 @@ for line in text.splitlines():
 
     line = line.strip()
 
-    if line:
-        lines.append(line)
+    if not line:
+        continue
+
+    # Remove excessive whitespace
+    line = re.sub(
+        r"\s+",
+        " ",
+        line
+    )
+
+    lines.append(line)
 
 
 clean_text = "\n".join(lines)
 
 
 # --------------------------------------------------
-# Create output directory
+# Save cleaned text
 # --------------------------------------------------
 
 output_file.parent.mkdir(
@@ -84,10 +146,8 @@ output_file.parent.mkdir(
     exist_ok=True
 )
 
-
-# --------------------------------------------------
-# Save cleaned text
-# --------------------------------------------------
+# Fix common mojibake encoding issues
+clean_text = clean_text.encode("latin1", errors="ignore").decode("utf-8", errors="ignore")
 
 output_file.write_text(
     clean_text,
@@ -96,8 +156,15 @@ output_file.write_text(
 
 
 # --------------------------------------------------
-# Display results
+# Results
 # --------------------------------------------------
 
-print("Clean text characters:", len(clean_text))
-print("Saved to:", output_file)
+print(
+    "Clean text characters:",
+    len(clean_text)
+)
+
+print(
+    "Saved to:",
+    output_file
+)
