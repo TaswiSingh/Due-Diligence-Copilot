@@ -1,22 +1,9 @@
-# Virtual environment
 venv/
-
-# Python cache
+.venv/
 __pycache__/
 *.pyc
-
-# Environment variables / secrets
 .env
-
-# SEC downloaded data
-data/raw/
-data/processed/
-
-# Jupyter
-.ipynb_checkpoints/
-
-# Logs
+.streamlit/secrets.toml
+.vscode/
+.idea/
 *.log
-
-# Generated embeddings
-data/processed/*.npy
