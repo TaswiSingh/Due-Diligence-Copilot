@@ -259,11 +259,16 @@ if st.button(
 
 - Section: `{chunk.get('section', 'Unknown')}`
 - Section chunk: `{chunk.get('section_chunk', 'unknown')}`
-- Semantic similarity: `{item['semantic_score']:.4f}`
-- Keyword score: `{item['keyword_score']:.4f}`
-- Topic score: `{item['topic_score']:.4f}`
-- Risk-category score: `{item['risk_category_score']:.4f}`
-- Final score: `{item['final_score']:.4f}`
+- Semantic similarity: `{item.get('semantic_score', 0):.4f}`
+- Keyword score: `{item.get('keyword_score', 0):.4f}
+- Entity score: `{item.get('entity_score', 0):.4f}`
+- Metric score: `{item.get('metric_score', 0):.4f}`
+- Year score: `{item.get('year_score', 0):.4f}`
+- Value score: `{item.get('value_score', 0):.4f}`
+- Topic score: `{item.get('topic_score', 0):.4f}`
+- Priority score: `{item.get('priority_score', 0):.4f}`
+- Risk-category score: `{item.get('risk_category_score', 0):.4f}`
+- Final score: `{item.get('final_score', 0):.4f}`
 """
                     )
 

@@ -3,5 +3,6 @@ numpy
 requests
 sentence-transformers
 torch
+torchvision
 beautifulsoup4
 ollama

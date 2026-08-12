@@ -3,36 +3,38 @@ Due Diligence Copilot - Retrieval + Risk-Specific Evidence Analysis
 
 Pipeline:
 
-    Question
-        |
-        v
-    Topic + intent detection
-        |
-        v
-    Semantic + keyword + topic retrieval
-        |
-        v
-    Risk-category scoring
-        |
-        v
-    Risk-specific evidence extraction
-        |
-        v
-    Compact evidence context
-        |
-        v
-    Local Ollama LLM
-        |
-        v
-    Citation validation
-        |
-        +---- invalid --> deterministic evidence-grounded fallback
+Question
+    |
+    v
+Question type / topic / intent detection
+    |
+    +-----------------------------+
+    |                             |
+    v                             v
+Risk / qualitative            Fact / numeric
+retrieval                     retrieval
+    |                             |
+    +-------------+---------------+
+                  |
+                  v
+          Evidence scoring
+                  |
+                  v
+        Risk / fact evidence
+                  |
+                  v
+             Local Ollama
+                  |
+                  v
+          Citation validation
+                  |
+                  +---- invalid ----> deterministic fallback
 
 Designed for:
-    - Apple SEC filing chunks
-    - sentence-transformers embeddings
-    - local Ollama / llama3.2:3b
-    - evidence-grounded due-diligence answers
+- Apple SEC filing chunks
+- sentence-transformers embeddings
+- local Ollama / llama3.2:3b
+- evidence-grounded due-diligence answers
 """
 
 from __future__ import annotations
@@ -41,6 +43,7 @@ from pathlib import Path
 import json
 import re
 import sys
+import os
 from typing import Dict, List, Tuple, Optional
 
 import numpy as np
@@ -53,11 +56,9 @@ from sentence_transformers import SentenceTransformer
 # ============================================================
 
 SRC_DIR = Path(__file__).resolve().parent
-
 PROJECT_ROOT = SRC_DIR.parent
 
 DATA_DIR = PROJECT_ROOT / "data"
-
 PROCESSED_DIR = DATA_DIR / "processed"
 
 CHUNKS_PATH = PROCESSED_DIR / "apple_chunks.json"
@@ -70,9 +71,10 @@ EMBEDDINGS_PATH = PROCESSED_DIR / "apple_embeddings.npy"
 
 EMBEDDING_MODEL = "all-MiniLM-L6-v2"
 
-import os
-
-LLM_MODEL = os.getenv("LLM_MODEL", "llama3.2:3b")
+LLM_MODEL = os.getenv(
+    "LLM_MODEL",
+    "llama3.2:3b",
+)
 
 OLLAMA_BASE_URL = os.getenv(
     "OLLAMA_BASE_URL",
@@ -84,24 +86,28 @@ OLLAMA_TAGS_URL = f"{OLLAMA_BASE_URL}/api/tags"
 
 OLLAMA_TIMEOUT = 180
 
-# Retrieval configuration
 
-RETRIEVAL_CANDIDATES = 16
-
-LLM_CONTEXT_CHUNKS = 5
+# Retrieval
+RETRIEVAL_CANDIDATES = 20
+LLM_CONTEXT_CHUNKS = 6
 
 MAX_RISK_FINDINGS = 4
 
 MIN_FINAL_SCORE = 0.42
 
-
-# Retrieval weights
-
-SEMANTIC_WEIGHT = 0.35
+# General retrieval weights
+SEMANTIC_WEIGHT = 0.30
 KEYWORD_WEIGHT = 0.20
 TOPIC_WEIGHT = 0.15
 PRIORITY_WEIGHT = 0.15
-RISK_CATEGORY_WEIGHT = 0.15
+RISK_CATEGORY_WEIGHT = 0.20
+
+# Fact retrieval weights
+FACT_SEMANTIC_WEIGHT = 0.25
+FACT_KEYWORD_WEIGHT = 0.25
+FACT_ENTITY_WEIGHT = 0.20
+FACT_METRIC_WEIGHT = 0.20
+FACT_VALUE_WEIGHT = 0.10
 
 
 # ============================================================
@@ -578,7 +584,7 @@ def normalize_text(text: str) -> str:
     text = str(text or "").lower()
 
     text = re.sub(
-        r"[^a-z0-9\s-]",
+        r"[^a-z0-9%\$\.\-\(\)\s]",
         " ",
         text,
     )
@@ -593,9 +599,111 @@ def normalize_text(text: str) -> str:
 
 
 def tokenize(text: str) -> List[str]:
-    """Return normalized tokens."""
-
     return normalize_text(text).split()
+
+
+# ============================================================
+# QUESTION TYPE
+# ============================================================
+
+def detect_question_type(question: str) -> str:
+    """
+    Detect whether the question is primarily:
+
+    - fact
+    - ranking
+    - comparison
+    - exposure
+    - explanation
+    - general
+    """
+
+    q = normalize_text(question)
+
+    numeric_terms = [
+        "how much",
+        "how many",
+        "what percentage",
+        "what percent",
+        "percentage",
+        "percent",
+        "%",
+        "figure",
+        "amount",
+        "revenue",
+        "net sales",
+        "sales",
+        "growth",
+        "decline",
+        "increase",
+        "decrease",
+        "margin",
+        "rate",
+        "share",
+        "market share",
+        "reported",
+        "reported figure",
+        "in 2025",
+        "in 2024",
+        "in 2023",
+    ]
+
+    if any(term in q for term in numeric_terms):
+        return "fact"
+
+    if any(
+        term in q
+        for term in [
+            "biggest",
+            "largest",
+            "top",
+            "key",
+            "major",
+            "most significant",
+            "highest",
+            "main",
+            "greatest",
+            "primary",
+        ]
+    ):
+        return "ranking"
+
+    if any(
+        term in q
+        for term in [
+            "compare",
+            "comparison",
+            "versus",
+            "vs",
+            "difference",
+        ]
+    ):
+        return "comparison"
+
+    if any(
+        term in q
+        for term in [
+            "why",
+            "how",
+            "explain",
+            "explanation",
+            "what causes",
+        ]
+    ):
+        return "explanation"
+
+    if any(
+        term in q
+        for term in [
+            "risk",
+            "risks",
+            "exposure",
+            "exposures",
+        ]
+    ):
+        return "exposure"
+
+    return "general"
 
 
 # ============================================================
@@ -603,19 +711,12 @@ def tokenize(text: str) -> List[str]:
 # ============================================================
 
 def load_chunks() -> List[dict]:
-    """Load chunks from processed Apple chunks file."""
-
-    print(
-        f"Loading chunks from: {CHUNKS_PATH}"
-    )
+    print(f"Loading chunks from: {CHUNKS_PATH}")
 
     if not CHUNKS_PATH.exists():
-
         raise FileNotFoundError(
-            f"Could not find chunks file:\n"
-            f"{CHUNKS_PATH}\n\n"
-            f"Expected file:\n"
-            f"data/processed/apple_chunks.json"
+            f"Could not find chunks file:\n{CHUNKS_PATH}\n\n"
+            f"Expected:\ndata/processed/apple_chunks.json"
         )
 
     with open(
@@ -623,34 +724,24 @@ def load_chunks() -> List[dict]:
         "r",
         encoding="utf-8",
     ) as f:
-
         data = json.load(f)
 
     if isinstance(data, dict):
 
         if "chunks" in data:
-
             chunks = data["chunks"]
-
         else:
-
-            chunks = list(
-                data.values()
-            )
+            chunks = list(data.values())
 
     elif isinstance(data, list):
-
         chunks = data
 
     else:
-
         raise ValueError(
-            "apple_chunks.json must contain "
-            "a list or dictionary."
+            "apple_chunks.json must contain a list or dictionary."
         )
 
     if not chunks:
-
         raise ValueError(
             "The chunks file contains no chunks."
         )
@@ -659,19 +750,13 @@ def load_chunks() -> List[dict]:
 
 
 def load_embeddings() -> np.ndarray:
-    """Load embedding vectors."""
-
-    print(
-        f"Loading embeddings from: {EMBEDDINGS_PATH}"
-    )
+    print(f"Loading embeddings from: {EMBEDDINGS_PATH}")
 
     if not EMBEDDINGS_PATH.exists():
-
         raise FileNotFoundError(
             f"Could not find embeddings file:\n"
             f"{EMBEDDINGS_PATH}\n\n"
-            f"Expected file:\n"
-            f"data/processed/apple_embeddings.npy"
+            f"Expected:\ndata/processed/apple_embeddings.npy"
         )
 
     embeddings = np.load(
@@ -682,17 +767,14 @@ def load_embeddings() -> np.ndarray:
         embeddings,
         np.ndarray,
     ):
-
         embeddings = np.asarray(
             embeddings
         )
 
     if embeddings.ndim != 2:
-
         raise ValueError(
-            "Embeddings must be a 2-dimensional "
-            f"numpy array. Received shape: "
-            f"{embeddings.shape}"
+            "Embeddings must be 2-dimensional. "
+            f"Received shape: {embeddings.shape}"
         )
 
     return embeddings
@@ -703,10 +785,7 @@ def load_embeddings() -> np.ndarray:
 # ============================================================
 
 def check_ollama() -> None:
-    """Check whether Ollama is running."""
-
     try:
-
         response = requests.get(
             OLLAMA_TAGS_URL,
             timeout=10,
@@ -715,18 +794,13 @@ def check_ollama() -> None:
         response.raise_for_status()
 
     except Exception as exc:
-
         raise RuntimeError(
-            "Could not connect to Ollama at "
-            "http://localhost:11434.\n"
+            f"Could not connect to Ollama at {OLLAMA_BASE_URL}.\n"
             "Make sure Ollama is running."
         ) from exc
 
 
-def generate_with_ollama(
-    prompt: str,
-) -> str:
-    """Generate an answer using local Ollama."""
+def generate_with_ollama(prompt: str) -> str:
 
     payload = {
         "model": LLM_MODEL,
@@ -754,7 +828,6 @@ def generate_with_ollama(
     ).strip()
 
     if not answer:
-
         raise RuntimeError(
             "Ollama returned an empty response."
         )
@@ -766,14 +839,9 @@ def generate_with_ollama(
 # TOPIC DETECTION
 # ============================================================
 
-def detect_topics(
-    question: str,
-) -> List[str]:
-    """Detect question topics."""
+def detect_topics(question: str) -> List[str]:
 
-    q = normalize_text(
-        question
-    )
+    q = normalize_text(question)
 
     scores: Dict[str, int] = {}
 
@@ -796,11 +864,9 @@ def detect_topics(
                 )
 
         if score > 0:
-
             scores[topic] = score
 
     if not scores:
-
         return []
 
     ordered = sorted(
@@ -820,23 +886,12 @@ def detect_topics(
 # INTENT DETECTION
 # ============================================================
 
-def detect_intent(
-    question: str,
-) -> str:
-    """
-    Detect broad question intent.
+def detect_intent(question: str) -> str:
 
-    Returns:
-        ranking
-        exposure
-        explanation
-        comparison
-        general
-    """
+    q = normalize_text(question)
 
-    q = normalize_text(
-        question
-    )
+    if detect_question_type(question) == "fact":
+        return "fact"
 
     ranking_phrases = [
         "biggest",
@@ -871,21 +926,18 @@ def detect_intent(
         phrase in q
         for phrase in ranking_phrases
     ):
-
         return "ranking"
 
     if any(
         phrase in q
         for phrase in comparison_phrases
     ):
-
         return "comparison"
 
     if any(
         phrase in q
         for phrase in explanation_phrases
     ):
-
         return "explanation"
 
     if any(
@@ -897,7 +949,6 @@ def detect_intent(
             "exposures",
         ]
     ):
-
         return "exposure"
 
     return "general"
@@ -911,23 +962,14 @@ def keyword_score(
     question: str,
     text: str,
 ) -> float:
-    """Calculate question/evidence keyword overlap."""
 
-    q = normalize_text(
-        question
-    )
-
-    t = normalize_text(
-        text
-    )
+    q = normalize_text(question)
+    t = normalize_text(text)
 
     if not q or not t:
-
         return 0.0
 
-    q_tokens = set(
-        tokenize(q)
-    )
+    q_tokens = set(tokenize(q))
 
     valid_tokens = [
         token
@@ -936,7 +978,6 @@ def keyword_score(
     ]
 
     if not valid_tokens:
-
         return 0.0
 
     matched = sum(
@@ -944,10 +985,7 @@ def keyword_score(
         for token in valid_tokens
     )
 
-    base = (
-        matched
-        / len(valid_tokens)
-    )
+    base = matched / len(valid_tokens)
 
     phrase_bonus = 0.0
 
@@ -955,16 +993,13 @@ def keyword_score(
 
         for phrase in topic_keywords:
 
-            p = normalize_text(
-                phrase
-            )
+            p = normalize_text(phrase)
 
             if (
                 " " in p
                 and p in q
                 and p in t
             ):
-
                 phrase_bonus += 0.10
 
     return min(
@@ -983,12 +1018,9 @@ def topic_score(
 ) -> float:
 
     if not topics:
-
         return 0.0
 
-    normalized = normalize_text(
-        text
-    )
+    normalized = normalize_text(text)
 
     scores = []
 
@@ -1000,24 +1032,19 @@ def topic_score(
         )
 
         if not keywords:
-
             continue
 
         matched = 0
 
         for keyword in keywords:
 
-            if normalize_text(
-                keyword
-            ) in normalized:
-
+            if normalize_text(keyword) in normalized:
                 matched += 1
 
         scores.append(
             min(
                 1.0,
-                matched
-                / max(
+                matched / max(
                     3,
                     len(keywords) * 0.25,
                 ),
@@ -1025,7 +1052,6 @@ def topic_score(
         )
 
     if not scores:
-
         return 0.0
 
     return min(
@@ -1042,13 +1068,8 @@ def risk_category_matches(
     text: str,
     topics: List[str],
 ) -> Dict[str, float]:
-    """
-    Calculate how strongly a chunk supports each risk category.
-    """
 
-    normalized = normalize_text(
-        text
-    )
+    normalized = normalize_text(text)
 
     scores: Dict[str, float] = {}
 
@@ -1063,7 +1084,6 @@ def risk_category_matches(
             topic in topics
             for topic in category_topics
         ):
-
             continue
 
         keywords = definition.get(
@@ -1072,29 +1092,22 @@ def risk_category_matches(
         )
 
         matched_phrases = 0
-
         weighted_score = 0.0
 
         for keyword in keywords:
 
-            phrase = normalize_text(
-                keyword
-            )
+            phrase = normalize_text(keyword)
 
             if phrase in normalized:
 
                 matched_phrases += 1
 
                 if " " in phrase:
-
                     weighted_score += 0.25
-
                 else:
-
                     weighted_score += 0.10
 
         if matched_phrases:
-
             scores[category] = min(
                 1.0,
                 weighted_score,
@@ -1114,12 +1127,9 @@ def best_risk_category_score(
     )
 
     if not scores:
-
         return 0.0
 
-    return max(
-        scores.values()
-    )
+    return max(scores.values())
 
 
 # ============================================================
@@ -1131,29 +1141,14 @@ def question_type_priority(
     chunk: dict,
     topics: List[str],
 ) -> float:
-    """
-    Additional relevance signal.
-
-    Gives priority to evidence that directly addresses
-    the requested topic rather than generic risk language.
-    """
 
     text = normalize_text(
-        chunk.get(
-            "text",
-            "",
-        )
+        chunk.get("text", "")
     )
 
-    q = normalize_text(
-        question
-    )
+    q = normalize_text(question)
 
     bonus = 0.0
-
-    # --------------------------------------------------------
-    # Supply chain
-    # --------------------------------------------------------
 
     if "supply_chain" in topics:
 
@@ -1188,10 +1183,6 @@ def question_type_priority(
             matches * 0.035,
         )
 
-    # --------------------------------------------------------
-    # Regulatory
-    # --------------------------------------------------------
-
     if "regulatory" in topics:
 
         phrases = [
@@ -1220,10 +1211,6 @@ def question_type_priority(
             matches * 0.035,
         )
 
-    # --------------------------------------------------------
-    # Cybersecurity
-    # --------------------------------------------------------
-
     if "cybersecurity" in topics:
 
         phrases = [
@@ -1248,10 +1235,6 @@ def question_type_priority(
             0.35,
             matches * 0.035,
         )
-
-    # --------------------------------------------------------
-    # Financial
-    # --------------------------------------------------------
 
     if "financial" in topics:
 
@@ -1279,8 +1262,6 @@ def question_type_priority(
             matches * 0.035,
         )
 
-    # Direct question phrase overlap.
-
     for topic in topics:
 
         for phrase in TOPIC_KEYWORDS.get(
@@ -1288,15 +1269,12 @@ def question_type_priority(
             [],
         ):
 
-            p = normalize_text(
-                phrase
-            )
+            p = normalize_text(phrase)
 
             if (
                 p in q
                 and p in text
             ):
-
                 bonus += 0.03
 
     return min(
@@ -1319,7 +1297,6 @@ def cosine_similarity(
     )
 
     if query_norm == 0:
-
         return np.zeros(
             len(embeddings)
         )
@@ -1356,40 +1333,689 @@ def cosine_similarity(
 def normalize_score_array(
     values: List[float],
 ) -> List[float]:
-    """
-    Min-max normalize scores to 0-1.
-
-    This makes retrieval diagnostics easier to interpret.
-    """
 
     if not values:
-
         return []
 
     minimum = min(values)
-
     maximum = max(values)
 
     if maximum - minimum < 1e-12:
-
-        return [
-            1.0
-            for _ in values
-        ]
+        return [1.0 for _ in values]
 
     return [
-        (
-            value - minimum
-        )
-        / (
-            maximum - minimum
-        )
+        (value - minimum)
+        / (maximum - minimum)
         for value in values
     ]
 
 
 # ============================================================
-# RETRIEVAL
+# FACT / NUMERIC HELPERS
+# ============================================================
+
+def extract_numbers(text: str) -> List[str]:
+    """
+    Extract numbers, percentages, currency values and common
+    financial figures.
+    """
+
+    if not text:
+        return []
+
+    pattern = re.compile(
+        r"""
+        (?:
+            \$\s*
+        )?
+        \d{1,3}(?:,\d{3})*(?:\.\d+)?
+        \s*
+        %?
+        |
+        \d+(?:\.\d+)?\s*%
+        """,
+        re.VERBOSE,
+    )
+
+    return [
+        match.group(0).strip()
+        for match in pattern.finditer(text)
+    ]
+
+
+def has_numeric_question(question: str) -> bool:
+    q = normalize_text(question)
+
+    return any(
+        term in q
+        for term in [
+            "percentage",
+            "percent",
+            "%",
+            "how much",
+            "how many",
+            "amount",
+            "figure",
+            "growth",
+            "rate",
+            "margin",
+            "share",
+            "revenue",
+            "net sales",
+            "sales",
+            "2025",
+            "2024",
+            "2023",
+        ]
+    )
+
+
+def extract_years(question: str) -> List[str]:
+    return re.findall(
+        r"\b20\d{2}\b",
+        question,
+    )
+
+
+def metric_terms(question: str) -> List[str]:
+    """
+    Extract important metric phrases from a question.
+
+    This is deliberately conservative so that a question such as:
+
+        What was iPhone net sales growth in 2025?
+
+    strongly prefers chunks containing:
+
+        iPhone
+        net sales
+        growth
+        2025
+    """
+
+    q = normalize_text(question)
+
+    known_metrics = [
+        "net sales",
+        "total net sales",
+        "iphone net sales",
+        "iphone",
+        "mac",
+        "ipad",
+        "wearables home and accessories",
+        "services",
+        "gross margin",
+        "operating margin",
+        "operating income",
+        "net income",
+        "earnings per share",
+        "eps",
+        "revenue",
+        "market share",
+        "direct distribution channels",
+        "indirect distribution channels",
+        "distribution channels",
+        "tax rate",
+        "effective tax rate",
+        "growth",
+        "decline",
+        "increase",
+        "decrease",
+        "percentage",
+        "percent",
+        "margin",
+        "rate",
+        "share",
+    ]
+
+    found = []
+
+    for metric in known_metrics:
+
+        if metric in q:
+            found.append(metric)
+
+    # Add multi-word noun phrases from the question.
+
+    stop_words = {
+        "what",
+        "was",
+        "were",
+        "the",
+        "a",
+        "an",
+        "of",
+        "in",
+        "for",
+        "from",
+        "to",
+        "and",
+        "did",
+        "how",
+        "much",
+        "many",
+        "does",
+        "is",
+        "are",
+        "company",
+        "companies",
+        "apple",
+    }
+
+    tokens = [
+        token
+        for token in tokenize(q)
+        if len(token) >= 3
+        and token not in stop_words
+        and not token.isdigit()
+    ]
+
+    for token in tokens:
+
+        if token not in found:
+            found.append(token)
+
+    return found
+
+
+def fact_entity_score(
+    question: str,
+    text: str,
+) -> float:
+
+    q = normalize_text(question)
+    t = normalize_text(text)
+
+    terms = metric_terms(question)
+
+    if not terms:
+        return 0.0
+
+    matched = 0
+    weighted = 0.0
+
+    high_value_terms = {
+        "iphone",
+        "mac",
+        "ipad",
+        "services",
+        "net sales",
+        "total net sales",
+        "direct distribution channels",
+        "indirect distribution channels",
+        "market share",
+        "gross margin",
+        "operating margin",
+    }
+
+    for term in terms:
+
+        if term in t:
+
+            matched += 1
+
+            if term in high_value_terms:
+                weighted += 0.18
+            elif " " in term:
+                weighted += 0.12
+            else:
+                weighted += 0.05
+
+    score = weighted
+
+    # Explicit question phrase match.
+    for term in terms:
+
+        if (
+            " " in term
+            and term in q
+            and term in t
+        ):
+            score += 0.08
+
+    return min(
+        1.0,
+        score,
+    )
+
+
+def fact_metric_score(
+    question: str,
+    text: str,
+) -> float:
+
+    q = normalize_text(question)
+    t = normalize_text(text)
+
+    score = 0.0
+
+    metric_pairs = [
+        ("net sales", "net sales"),
+        ("growth", "growth"),
+        ("decline", "decline"),
+        ("increase", "increase"),
+        ("decrease", "decrease"),
+        ("percentage", "%"),
+        ("percent", "%"),
+        ("market share", "market share"),
+        ("margin", "margin"),
+        ("rate", "rate"),
+        ("direct distribution", "direct"),
+        ("indirect distribution", "indirect"),
+    ]
+
+    for question_term, text_term in metric_pairs:
+
+        if (
+            question_term in q
+            and text_term in t
+        ):
+            score += 0.15
+
+    # Important: if question asks for growth, prefer a chunk
+    # that contains a percentage adjacent to growth/change.
+    if any(
+        term in q
+        for term in [
+            "growth",
+            "increase",
+            "decrease",
+            "decline",
+            "change",
+        ]
+    ):
+
+        if re.search(
+            r"(growth|increase|decrease|decline|change).{0,80}%|"
+            r"% .{0,80}(growth|increase|decrease|decline|change)",
+            t,
+        ):
+            score += 0.25
+
+    # If question asks for a percentage, require percentage
+    # evidence when possible.
+    if any(
+        term in q
+        for term in [
+            "percentage",
+            "percent",
+            "%",
+        ]
+    ):
+
+        if "%" in t:
+            score += 0.35
+
+    return min(
+        1.0,
+        score,
+    )
+
+
+def fact_year_score(
+    question: str,
+    text: str,
+) -> float:
+
+    years = extract_years(question)
+
+    if not years:
+        return 0.0
+
+    normalized = normalize_text(text)
+
+    matched = sum(
+        year in normalized
+        for year in years
+    )
+
+    return min(
+        1.0,
+        matched / len(years),
+    )
+
+
+def fact_value_score(
+    question: str,
+    text: str,
+) -> float:
+
+    q = normalize_text(question)
+    t = normalize_text(text)
+
+    numbers = extract_numbers(text)
+
+    if not numbers:
+        return 0.0
+
+    score = 0.0
+
+    if any(
+        term in q
+        for term in [
+            "percentage",
+            "percent",
+            "%",
+            "growth",
+            "rate",
+            "margin",
+            "share",
+        ]
+    ):
+
+        if "%" in t:
+            score += 0.65
+
+    if any(
+        term in q
+        for term in [
+            "how much",
+            "amount",
+            "net sales",
+            "revenue",
+            "sales",
+            "income",
+            "earnings",
+        ]
+    ):
+
+        if numbers:
+            score += 0.25
+
+    return min(
+        1.0,
+        score,
+    )
+
+
+def fact_sentence_score(
+    question: str,
+    sentence: str,
+) -> float:
+
+    normalized = normalize_text(sentence)
+
+    score = 0.0
+
+    score += keyword_score(
+        question,
+        sentence,
+    ) * 0.30
+
+    score += fact_entity_score(
+        question,
+        sentence,
+    ) * 0.25
+
+    score += fact_metric_score(
+        question,
+        sentence,
+    ) * 0.30
+
+    score += fact_year_score(
+        question,
+        sentence,
+    ) * 0.10
+
+    score += fact_value_score(
+        question,
+        sentence,
+    ) * 0.05
+
+    return min(
+        1.0,
+        score,
+    )
+
+
+# ============================================================
+# SENTENCE SPLITTING
+# ============================================================
+
+def split_into_sentences(
+    text: str,
+) -> List[str]:
+
+    text = re.sub(
+        r"\s+",
+        " ",
+        text,
+    ).strip()
+
+    if not text:
+        return []
+
+    sentences = re.split(
+        r"(?<=[.!?])\s+",
+        text,
+    )
+
+    cleaned = []
+
+    for sentence in sentences:
+
+        sentence = sentence.strip()
+
+        if len(sentence) > 10:
+            cleaned.append(sentence)
+
+    return cleaned
+
+
+# ============================================================
+# FACT EVIDENCE EXTRACTION
+# ============================================================
+
+def extract_fact_evidence(
+    question: str,
+    text: str,
+    max_chars: int = 1200,
+) -> Optional[str]:
+
+    sentences = split_into_sentences(
+        text
+    )
+
+    if not sentences:
+        return None
+
+    scored = []
+
+    for index, sentence in enumerate(
+        sentences
+    ):
+
+        score = fact_sentence_score(
+            question,
+            sentence,
+        )
+
+        scored.append(
+            (
+                score,
+                index,
+                sentence,
+            )
+        )
+
+    scored.sort(
+        key=lambda x: x[0],
+        reverse=True,
+    )
+
+    if not scored:
+        return None
+
+    best_score, best_index, best_sentence = scored[0]
+
+    if best_score <= 0:
+        return None
+
+    selected = [
+        best_sentence
+    ]
+
+    # Add a nearby sentence if it has strong support.
+    for score, index, sentence in scored[1:4]:
+
+        if (
+            score >= best_score * 0.70
+            and abs(index - best_index) <= 1
+        ):
+            selected.append(sentence)
+
+    evidence = " ".join(selected)
+
+    if len(evidence) > max_chars:
+
+        evidence = evidence[:max_chars]
+
+        if " " in evidence:
+            evidence = evidence.rsplit(
+                " ",
+                1,
+            )[0]
+
+        evidence += "..."
+
+    return evidence
+
+
+# ============================================================
+# FACT RETRIEVAL
+# ============================================================
+
+def retrieve_fact(
+    question: str,
+    chunks: List[dict],
+    embeddings: np.ndarray,
+    query_embedding_model: SentenceTransformer,
+) -> Tuple[List[dict], List[str], str]:
+
+    topics = detect_topics(
+        question
+    )
+
+    intent = "fact"
+
+    query_embedding = query_embedding_model.encode(
+        question,
+        normalize_embeddings=True,
+    )
+
+    similarities = cosine_similarity(
+        query_embedding,
+        embeddings,
+    )
+
+    candidates = []
+
+    for index, chunk in enumerate(chunks):
+
+        text = chunk.get(
+            "text",
+            "",
+        )
+
+        semantic = float(
+            similarities[index]
+        )
+
+        keyword = keyword_score(
+            question,
+            text,
+        )
+
+        entity = fact_entity_score(
+            question,
+            text,
+        )
+
+        metric = fact_metric_score(
+            question,
+            text,
+        )
+
+        year = fact_year_score(
+            question,
+            text,
+        )
+
+        value = fact_value_score(
+            question,
+            text,
+        )
+
+        # Year is incorporated into entity/metric relevance
+        # rather than dominating the entire score.
+        fact_final = (
+            semantic * FACT_SEMANTIC_WEIGHT
+            + keyword * FACT_KEYWORD_WEIGHT
+            + entity * FACT_ENTITY_WEIGHT
+            + metric * FACT_METRIC_WEIGHT
+            + value * FACT_VALUE_WEIGHT
+        )
+
+        # Strong explicit year match gets a controlled bonus.
+        if year > 0:
+            fact_final += 0.10 * year
+
+        candidates.append(
+            {
+                "chunk": chunk,
+                "semantic_score": semantic,
+                "keyword_score": keyword,
+                "entity_score": entity,
+                "metric_score": metric,
+                "year_score": year,
+                "value_score": value,
+                "raw_final_score": fact_final,
+            }
+        )
+
+    candidates.sort(
+        key=lambda x: x["raw_final_score"],
+        reverse=True,
+    )
+
+    top_candidates = candidates[
+        :RETRIEVAL_CANDIDATES
+    ]
+
+    # Normalize only after candidate selection.
+    raw_scores = [
+        item["raw_final_score"]
+        for item in top_candidates
+    ]
+
+    normalized_scores = normalize_score_array(
+        raw_scores
+    )
+
+    for item, normalized in zip(
+        top_candidates,
+        normalized_scores,
+    ):
+        item["final_score"] = normalized
+
+    top_candidates.sort(
+        key=lambda x: x["final_score"],
+        reverse=True,
+    )
+
+    selected = top_candidates[
+        :LLM_CONTEXT_CHUNKS
+    ]
+
+    return (
+        selected,
+        topics,
+        intent,
+    )
+
+
+# ============================================================
+# GENERAL RETRIEVAL
 # ============================================================
 
 def retrieve(
@@ -1398,6 +2024,27 @@ def retrieve(
     embeddings: np.ndarray,
     query_embedding_model: SentenceTransformer,
 ) -> Tuple[List[dict], List[str], str]:
+
+    question_type = detect_question_type(
+        question
+    )
+
+    print(
+        f"Detected question type: {question_type}"
+    )
+
+    if question_type == "fact":
+
+        print(
+            "Using fact-aware retrieval..."
+        )
+
+        return retrieve_fact(
+            question=question,
+            chunks=chunks,
+            embeddings=embeddings,
+            query_embedding_model=query_embedding_model,
+        )
 
     print(
         "\nDetecting question topic..."
@@ -1428,11 +2075,9 @@ def retrieve(
         f"Detected intent: {intent}"
     )
 
-    query_embedding = (
-        query_embedding_model.encode(
-            question,
-            normalize_embeddings=True,
-        )
+    query_embedding = query_embedding_model.encode(
+        question,
+        normalize_embeddings=True,
     )
 
     similarities = cosine_similarity(
@@ -1477,9 +2122,7 @@ def retrieve(
         )
 
         risk_score = (
-            max(
-                risk_scores.values()
-            )
+            max(risk_scores.values())
             if risk_scores
             else 0.0
         )
@@ -1496,10 +2139,6 @@ def retrieve(
             }
         )
 
-    # --------------------------------------------------------
-    # Normalize the raw semantic signal.
-    # --------------------------------------------------------
-
     semantic_values = [
         item["semantic_score"]
         for item in candidates
@@ -1508,10 +2147,6 @@ def retrieve(
     normalized_semantic = normalize_score_array(
         semantic_values
     )
-
-    # --------------------------------------------------------
-    # Calculate final normalized score.
-    # --------------------------------------------------------
 
     for item, semantic_norm in zip(
         candidates,
@@ -1546,7 +2181,6 @@ def retrieve(
         candidates,
         normalized_final,
     ):
-
         item["final_score"] = normalized
 
     candidates.sort(
@@ -1572,10 +2206,6 @@ def retrieve(
             )
         ]
 
-    # --------------------------------------------------------
-    # Topic-aware filtering.
-    # --------------------------------------------------------
-
     if topics:
 
         topic_selected = [
@@ -1589,7 +2219,6 @@ def retrieve(
         ]
 
         if len(topic_selected) >= 2:
-
             selected = topic_selected
 
     selected = selected[
@@ -1604,47 +2233,6 @@ def retrieve(
 
 
 # ============================================================
-# SENTENCE SPLITTING
-# ============================================================
-
-def split_into_sentences(
-    text: str,
-) -> List[str]:
-    """
-    Lightweight sentence splitter suitable for SEC text.
-    """
-
-    text = re.sub(
-        r"\s+",
-        " ",
-        text,
-    ).strip()
-
-    if not text:
-
-        return []
-
-    sentences = re.split(
-        r"(?<=[.!?])\s+",
-        text,
-    )
-
-    cleaned = []
-
-    for sentence in sentences:
-
-        sentence = sentence.strip()
-
-        if len(sentence) > 20:
-
-            cleaned.append(
-                sentence
-            )
-
-    return cleaned
-
-
-# ============================================================
 # RISK-SPECIFIC EVIDENCE SCORING
 # ============================================================
 
@@ -1654,9 +2242,6 @@ def risk_evidence_sentence_score(
     category: str,
     topics: List[str],
 ) -> float:
-    """
-    Score one sentence for a particular risk category.
-    """
 
     normalized = normalize_text(
         sentence
@@ -1678,10 +2263,6 @@ def risk_evidence_sentence_score(
 
     score = 0.0
 
-    # --------------------------------------------------------
-    # Category keyword matches
-    # --------------------------------------------------------
-
     for keyword in keywords:
 
         phrase = normalize_text(
@@ -1691,16 +2272,9 @@ def risk_evidence_sentence_score(
         if phrase in normalized:
 
             if " " in phrase:
-
                 score += 0.25
-
             else:
-
                 score += 0.10
-
-    # --------------------------------------------------------
-    # Question overlap
-    # --------------------------------------------------------
 
     question_tokens = set(
         tokenize(q)
@@ -1708,13 +2282,11 @@ def risk_evidence_sentence_score(
 
     for token in question_tokens:
 
-        if len(token) >= 4 and token in normalized:
-
+        if (
+            len(token) >= 4
+            and token in normalized
+        ):
             score += 0.025
-
-    # --------------------------------------------------------
-    # Risk-impact language
-    # --------------------------------------------------------
 
     impact_phrases = [
         "adversely affect",
@@ -1737,12 +2309,7 @@ def risk_evidence_sentence_score(
     for phrase in impact_phrases:
 
         if phrase in normalized:
-
             score += 0.04
-
-    # --------------------------------------------------------
-    # Topic confirmation
-    # --------------------------------------------------------
 
     for topic in topics:
 
@@ -1751,10 +2318,7 @@ def risk_evidence_sentence_score(
             [],
         ):
 
-            if normalize_text(
-                keyword
-            ) in normalized:
-
+            if normalize_text(keyword) in normalized:
                 score += 0.02
 
     return min(
@@ -1774,20 +2338,12 @@ def extract_risk_evidence(
     topics: List[str],
     max_chars: int = 1000,
 ) -> Optional[str]:
-    """
-    Extract a short passage specifically supporting one risk.
-
-    Unlike the old extractor, this does not simply choose the
-    strongest generic sentence. It scores sentences against the
-    requested risk category.
-    """
 
     sentences = split_into_sentences(
         text
     )
 
     if not sentences:
-
         return None
 
     scored = []
@@ -1817,17 +2373,12 @@ def extract_risk_evidence(
     )
 
     if not scored:
-
         return None
 
     best_score = scored[0][0]
 
     if best_score <= 0:
-
         return None
-
-    # Take the strongest sentence plus nearby supporting
-    # sentences where appropriate.
 
     best_index = scored[0][1]
 
@@ -1837,29 +2388,20 @@ def extract_risk_evidence(
 
     for score, index, _ in scored[1:4]:
 
-        if score >= best_score * 0.55:
-
-            if abs(
-                index - best_index
-            ) <= 3:
-
-                selected_indices.append(
-                    index
-                )
+        if (
+            score >= best_score * 0.55
+            and abs(index - best_index) <= 3
+        ):
+            selected_indices.append(index)
 
     selected_indices = sorted(
         set(selected_indices)
     )
 
-    # Keep evidence compact.
-
-    passage_parts = []
-
-    for index in selected_indices:
-
-        passage_parts.append(
-            sentences[index]
-        )
+    passage_parts = [
+        sentences[index]
+        for index in selected_indices
+    ]
 
     passage = " ".join(
         passage_parts
@@ -1867,12 +2409,9 @@ def extract_risk_evidence(
 
     if len(passage) > max_chars:
 
-        passage = passage[
-            :max_chars
-        ]
+        passage = passage[:max_chars]
 
         if " " in passage:
-
             passage = passage.rsplit(
                 " ",
                 1,
@@ -1884,7 +2423,7 @@ def extract_risk_evidence(
 
 
 # ============================================================
-# BUILD RISK EVIDENCE SET
+# BUILD RISK EVIDENCE
 # ============================================================
 
 def build_risk_evidence(
@@ -1893,16 +2432,6 @@ def build_risk_evidence(
     topics: List[str],
     max_findings: int = MAX_RISK_FINDINGS,
 ) -> List[dict]:
-    """
-    Build distinct risk findings from retrieved chunks.
-
-    Each finding contains:
-        category
-        label
-        evidence
-        chunk_id
-        score
-    """
 
     category_candidates: Dict[
         str,
@@ -1926,7 +2455,6 @@ def build_risk_evidence(
         for category, category_score in category_scores.items():
 
             if category_score <= 0:
-
                 continue
 
             evidence = extract_risk_evidence(
@@ -1937,7 +2465,6 @@ def build_risk_evidence(
             )
 
             if not evidence:
-
                 continue
 
             evidence_score = risk_evidence_sentence_score(
@@ -1979,10 +2506,6 @@ def build_risk_evidence(
                 }
             )
 
-    # --------------------------------------------------------
-    # Choose strongest evidence for each category.
-    # --------------------------------------------------------
-
     best_by_category = []
 
     for category, items in category_candidates.items():
@@ -2001,24 +2524,15 @@ def build_risk_evidence(
         reverse=True,
     )
 
-    # --------------------------------------------------------
-    # Avoid near-duplicate findings.
-    # --------------------------------------------------------
-
     findings = []
 
     for candidate in best_by_category:
-
-        category = candidate["category"]
-
-        # Avoid two findings whose labels are identical.
 
         if any(
             finding["label"]
             == candidate["label"]
             for finding in findings
         ):
-
             continue
 
         findings.append(
@@ -2026,10 +2540,64 @@ def build_risk_evidence(
         )
 
         if len(findings) >= max_findings:
-
             break
 
     return findings
+
+
+# ============================================================
+# BUILD FACT EVIDENCE
+# ============================================================
+
+def build_fact_evidence(
+    question: str,
+    selected: List[dict],
+) -> List[dict]:
+
+    findings = []
+
+    for item in selected:
+
+        chunk = item["chunk"]
+
+        text = chunk.get(
+            "text",
+            "",
+        )
+
+        evidence = extract_fact_evidence(
+            question,
+            text,
+        )
+
+        if not evidence:
+            continue
+
+        score = fact_sentence_score(
+            question,
+            evidence,
+        )
+
+        findings.append(
+            {
+                "chunk": chunk,
+                "chunk_id": str(
+                    chunk.get(
+                        "chunk_id",
+                        "unknown",
+                    )
+                ),
+                "evidence": evidence,
+                "score": score,
+            }
+        )
+
+    findings.sort(
+        key=lambda x: x["score"],
+        reverse=True,
+    )
+
+    return findings[:4]
 
 
 # ============================================================
@@ -2039,9 +2607,6 @@ def build_risk_evidence(
 def build_llm_context(
     risk_evidence: List[dict],
 ) -> str:
-    """
-    Build compact, risk-specific context for llama3.2:3b.
-    """
 
     sections = []
 
@@ -2051,21 +2616,45 @@ def build_llm_context(
     ):
 
         sections.append(
-            f"""
-RISK {number}
-Risk category: {item["label"]}
-Chunk ID: {item["chunk_id"]}
-
-Evidence:
-{item["evidence"]}
-""".strip()
+            (
+                f"RISK {number}\n"
+                f"Risk category: {item['label']}\n"
+                f"Chunk ID: {item['chunk_id']}\n\n"
+                f"Evidence:\n"
+                f"{item['evidence']}"
+            )
         )
 
     if not sections:
+        return "No risk-specific evidence was extracted."
 
-        return (
-            "No risk-specific evidence was extracted."
+    return "\n\n".join(
+        sections
+    )
+
+
+def build_fact_context(
+    fact_evidence: List[dict],
+) -> str:
+
+    sections = []
+
+    for number, item in enumerate(
+        fact_evidence,
+        start=1,
+    ):
+
+        sections.append(
+            (
+                f"FACT {number}\n"
+                f"Chunk ID: {item['chunk_id']}\n\n"
+                f"Evidence:\n"
+                f"{item['evidence']}"
+            )
         )
+
+    if not sections:
+        return "No fact-specific evidence was extracted."
 
     return "\n\n".join(
         sections
@@ -2073,10 +2662,10 @@ Evidence:
 
 
 # ============================================================
-# PROMPT
+# PROMPT - RISK
 # ============================================================
 
-def build_prompt(
+def build_risk_prompt(
     question: str,
     topics: List[str],
     intent: str,
@@ -2092,7 +2681,7 @@ def build_prompt(
     return f"""
 You are a financial due-diligence analyst.
 
-Answer the user's EXACT question using ONLY the risk-specific evidence below.
+Answer the user's EXACT question using ONLY the evidence below.
 
 USER QUESTION:
 {question}
@@ -2105,23 +2694,21 @@ DETECTED INTENT:
 
 STRICT RULES:
 
-1. Answer the user's exact question.
+1. Answer the exact question.
 2. Do not say the question is missing.
 3. Do not ask for another question.
-4. Do not discuss these instructions.
-5. Do not invent facts.
-6. Do not introduce risks that are not supported by the supplied evidence.
-7. For a ranking question, present the strongest supported risks first.
-8. The filing does not necessarily provide a numerical ranking. Do not claim
-   that a risk is objectively the largest unless the evidence establishes that.
-9. Explain why each identified issue matters for due diligence.
-10. Every Key Finding MUST contain an Evidence citation.
-11. The Evidence citation MUST use the exact Chunk ID supplied below.
-12. Do not cite any chunk that is not supplied below.
+4. Do not invent facts.
+5. Do not introduce risks unsupported by the evidence.
+6. For ranking questions, present strongest supported risks first.
+7. Do not claim a risk is objectively the largest unless the filing establishes this.
+8. Explain why each issue matters.
+9. Every finding MUST contain an Evidence citation.
+10. Every citation MUST use an exact Chunk ID supplied below.
+11. Never cite a chunk not supplied below.
+12. Prefer 3-4 strong findings over weak findings.
 13. Keep the answer concise.
-14. Prefer 3-4 strong findings over many weak findings.
 
-Use EXACTLY this citation format:
+Citation format:
 
 **Evidence:** Chunk X
 
@@ -2135,43 +2722,102 @@ OUTPUT FORMAT:
 
 ### 1. [Risk]
 
-**What the filing says:** [brief evidence-grounded statement]
+**What the filing says:** [evidence-grounded statement]
 
-**Why it matters:** [brief analytical explanation]
+**Why it matters:** [brief analysis]
 
 **Evidence:** Chunk X
 
 ### 2. [Risk]
 
-**What the filing says:** [brief evidence-grounded statement]
+**What the filing says:** [evidence-grounded statement]
 
-**Why it matters:** [brief analytical explanation]
+**Why it matters:** [brief analysis]
 
 **Evidence:** Chunk X
 
 ### 3. [Risk]
 
-**What the filing says:** [brief evidence-grounded statement]
+**What the filing says:** [evidence-grounded statement]
 
-**Why it matters:** [brief analytical explanation]
+**Why it matters:** [brief analysis]
 
 **Evidence:** Chunk X
 
 ### 4. [Risk]
 
-**What the filing says:** [brief evidence-grounded statement]
+**What the filing says:** [evidence-grounded statement]
 
-**Why it matters:** [brief analytical explanation]
+**Why it matters:** [brief analysis]
 
 **Evidence:** Chunk X
 
-Only include findings for which evidence is actually supplied.
+Only include findings actually supported by evidence.
 
 ## Evidence Limitations
 
 One short paragraph explaining what the retrieved evidence cannot establish.
 
 RISK-SPECIFIC EVIDENCE:
+
+{evidence_context}
+""".strip()
+
+
+# ============================================================
+# PROMPT - FACT
+# ============================================================
+
+def build_fact_prompt(
+    question: str,
+    evidence_context: str,
+) -> str:
+
+    return f"""
+You are a financial due-diligence analyst.
+
+Answer the user's EXACT factual question using ONLY the supplied SEC filing evidence.
+
+USER QUESTION:
+{question}
+
+STRICT RULES:
+
+1. Answer the exact metric requested.
+2. Do not substitute a different percentage, amount, year, product or metric.
+3. If the question asks for a percentage, return the percentage explicitly supported by the evidence.
+4. If the question asks for growth, return the growth/change figure, not the product's dollar sales unless that is all the evidence establishes.
+5. If multiple numbers appear in the same evidence, identify the one that corresponds exactly to the requested metric.
+6. Do not calculate or infer a value unless the supplied evidence explicitly supports the calculation.
+7. Do not invent facts.
+8. Every factual statement must be supported by the supplied evidence.
+9. Every answer must contain an Evidence citation.
+10. Use only the exact Chunk ID supplied below.
+11. Do not cite chunks that are not supplied.
+12. If the exact requested figure is not established, explicitly say so.
+13. Keep the answer concise.
+
+Citation format:
+
+**Evidence:** Chunk X
+
+OUTPUT FORMAT:
+
+## Answer
+
+[Direct answer to the exact question.]
+
+## Evidence
+
+[Short quotation/paraphrase from the supplied filing evidence.]
+
+**Evidence:** Chunk X
+
+## Evidence Limitations
+
+[One short sentence explaining any limitation.]
+
+FACT-SPECIFIC EVIDENCE:
 
 {evidence_context}
 """.strip()
@@ -2287,14 +2933,13 @@ def answer_is_generic(
     )
 
     if generic_hits >= 2:
-
         return True
 
     if (
         "key findings" not in normalized
         and "conclusion" not in normalized
+        and "answer" not in normalized
     ):
-
         return True
 
     return False
@@ -2306,27 +2951,21 @@ def answer_is_generic(
 
 def answer_has_evidence_citations(
     answer: str,
-    risk_evidence: List[dict],
+    evidence: List[dict],
+    fact_mode: bool = False,
 ) -> bool:
-    """
-    Validate citations against actual retrieved risk evidence.
 
-    We validate each numbered finding independently.
-    """
-
-    if not risk_evidence:
-
+    if not evidence:
         return False
 
     valid_chunk_ids = {
         str(
             item["chunk_id"]
         ).strip()
-        for item in risk_evidence
+        for item in evidence
     }
 
     if not valid_chunk_ids:
-
         return False
 
     citation_pattern = re.compile(
@@ -2339,18 +2978,16 @@ def answer_has_evidence_citations(
     )
 
     if not citations:
-
         return False
-
-    # Every citation must refer to retrieved evidence.
 
     for citation in citations:
 
         if citation.strip() not in valid_chunk_ids:
-
             return False
 
-    # Locate numbered findings.
+    if fact_mode:
+
+        return True
 
     finding_sections = re.findall(
         r"###\s+\d+\..*?(?=###\s+\d+\.|##\s+Evidence Limitations|$)",
@@ -2359,20 +2996,101 @@ def answer_has_evidence_citations(
     )
 
     if not finding_sections:
-
         return False
-
-    # Every finding must have its own citation.
 
     for finding in finding_sections:
 
         if not citation_pattern.search(
             finding
         ):
-
             return False
 
     return True
+
+
+# ============================================================
+# FACT CITATION VALIDATION
+# ============================================================
+
+def fact_answer_contains_unsupported_number(
+    answer: str,
+    evidence: List[dict],
+) -> bool:
+    """
+    Conservative validation.
+
+    Extract numbers from the answer and make sure they appear
+    somewhere in the retrieved evidence.
+
+    This prevents the LLM from inventing a percentage.
+    """
+
+    answer_numbers = extract_numbers(
+        answer
+    )
+
+    evidence_text = " ".join(
+        item["evidence"]
+        for item in evidence
+    )
+
+    normalized_evidence = normalize_text(
+        evidence_text
+    )
+
+    for number in answer_numbers:
+
+        normalized_number = normalize_text(
+            number
+        )
+
+        if normalized_number not in normalized_evidence:
+
+            # Ignore years in normal explanatory text.
+            if re.fullmatch(
+                r"20\d{2}",
+                normalized_number,
+            ):
+                continue
+
+            return True
+
+    return False
+
+
+# ============================================================
+# DETERMINISTIC FACT FALLBACK
+# ============================================================
+
+def deterministic_fact_answer(
+    question: str,
+    fact_evidence: List[dict],
+) -> str:
+
+    if not fact_evidence:
+
+        return (
+            "## Answer\n\n"
+            "The retrieved filing evidence does not "
+            "establish the exact figure requested.\n\n"
+            "## Evidence Limitations\n\n"
+            "No sufficiently relevant fact-specific "
+            "evidence was retrieved."
+        )
+
+    best = fact_evidence[0]
+
+    return (
+        "## Answer\n\n"
+        f"The retrieved 10-K evidence states:\n\n"
+        f"**{best['evidence']}**\n\n"
+        "## Evidence\n\n"
+        f"**Evidence:** Chunk {best['chunk_id']}\n\n"
+        "## Evidence Limitations\n\n"
+        "This answer uses the figure explicitly supported "
+        "by the retrieved filing evidence and does not infer "
+        "a different value."
+    )
 
 
 # ============================================================
@@ -2399,9 +3117,9 @@ def deterministic_conclusion(
     if len(labels) == 1:
 
         return (
-            f"The retrieved filing evidence identifies "
+            "The retrieved filing evidence identifies "
             f"{labels[0].lower()} as a material exposure "
-            f"relevant to the question."
+            "relevant to the question."
         )
 
     if len(labels) == 2:
@@ -2427,7 +3145,7 @@ def deterministic_conclusion(
 
 
 # ============================================================
-# DETERMINISTIC FALLBACK
+# DETERMINISTIC RISK FALLBACK
 # ============================================================
 
 def fallback_answer(
@@ -2511,6 +3229,96 @@ def analyze_question(
     intent: str,
 ) -> str:
 
+    question_type = detect_question_type(
+        question
+    )
+
+    # --------------------------------------------------------
+    # FACT MODE
+    # --------------------------------------------------------
+
+    if question_type == "fact":
+
+        fact_evidence = build_fact_evidence(
+            question=question,
+            selected=selected,
+        )
+
+        if not fact_evidence:
+
+            return deterministic_fact_answer(
+                question,
+                [],
+            )
+
+        context = build_fact_context(
+            fact_evidence
+        )
+
+        prompt = build_fact_prompt(
+            question=question,
+            evidence_context=context,
+        )
+
+        try:
+
+            answer = generate_with_ollama(
+                prompt
+            )
+
+            answer = clean_answer(
+                answer
+            )
+
+            if answer_has_question_confusion(
+                answer
+            ):
+                return deterministic_fact_answer(
+                    question,
+                    fact_evidence,
+                )
+
+            if not answer_has_evidence_citations(
+                answer,
+                fact_evidence,
+                fact_mode=True,
+            ):
+                return deterministic_fact_answer(
+                    question,
+                    fact_evidence,
+                )
+
+            if fact_answer_contains_unsupported_number(
+                answer,
+                fact_evidence,
+            ):
+                print(
+                    "Warning: LLM introduced an unsupported "
+                    "number. Using deterministic fact answer."
+                )
+
+                return deterministic_fact_answer(
+                    question,
+                    fact_evidence,
+                )
+
+            return answer
+
+        except Exception as exc:
+
+            print(
+                f"Warning: LLM generation failed: {exc}"
+            )
+
+            return deterministic_fact_answer(
+                question,
+                fact_evidence,
+            )
+
+    # --------------------------------------------------------
+    # RISK MODE
+    # --------------------------------------------------------
+
     if not selected:
 
         return fallback_answer(
@@ -2543,7 +3351,7 @@ def analyze_question(
         risk_evidence
     )
 
-    prompt = build_prompt(
+    prompt = build_risk_prompt(
         question=question,
         topics=topics,
         intent=intent,
@@ -2559,10 +3367,6 @@ def analyze_question(
         answer = clean_answer(
             answer
         )
-
-        # ----------------------------------------------------
-        # Validation 1
-        # ----------------------------------------------------
 
         if answer_has_question_confusion(
             answer
@@ -2580,10 +3384,6 @@ def analyze_question(
                 topics,
             )
 
-        # ----------------------------------------------------
-        # Validation 2
-        # ----------------------------------------------------
-
         if answer_is_generic(
             answer,
             question,
@@ -2600,10 +3400,6 @@ def analyze_question(
                 risk_evidence,
                 topics,
             )
-
-        # ----------------------------------------------------
-        # Validation 3
-        # ----------------------------------------------------
 
         if not answer_has_evidence_citations(
             answer,
@@ -2628,10 +3424,6 @@ def analyze_question(
 
         print(
             f"Warning: LLM generation failed: {exc}"
-        )
-
-        print(
-            "Using deterministic evidence answer."
         )
 
         return fallback_answer(
@@ -2683,59 +3475,85 @@ def print_evidence(
 
         print(
             f"Semantic similarity: "
-            f"{item['semantic_score']:.4f}"
+            f"{item.get('semantic_score', 0):.4f}"
         )
 
         print(
             f"Keyword score: "
-            f"{item['keyword_score']:.4f}"
+            f"{item.get('keyword_score', 0):.4f}"
         )
 
-        print(
-            f"Topic score: "
-            f"{item['topic_score']:.4f}"
-        )
+        if "entity_score" in item:
 
-        print(
-            f"Priority score: "
-            f"{item['priority_score']:.4f}"
-        )
+            print(
+                f"Entity score: "
+                f"{item['entity_score']:.4f}"
+            )
 
-        print(
-            f"Risk-category score: "
-            f"{item['risk_category_score']:.4f}"
-        )
+            print(
+                f"Metric score: "
+                f"{item['metric_score']:.4f}"
+            )
+
+            print(
+                f"Year score: "
+                f"{item['year_score']:.4f}"
+            )
+
+            print(
+                f"Value score: "
+                f"{item['value_score']:.4f}"
+            )
+
+        else:
+
+            print(
+                f"Topic score: "
+                f"{item.get('topic_score', 0):.4f}"
+            )
+
+            print(
+                f"Priority score: "
+                f"{item.get('priority_score', 0):.4f}"
+            )
+
+            print(
+                f"Risk-category score: "
+                f"{item.get('risk_category_score', 0):.4f}"
+            )
 
         print(
             f"Final score: "
-            f"{item['final_score']:.4f}"
+            f"{item.get('final_score', 0):.4f}"
         )
 
-        risk_scores = item.get(
-            "risk_category_scores",
-            {},
-        )
+        if "risk_category_scores" in item:
 
-        if risk_scores:
-
-            ordered = sorted(
-                risk_scores.items(),
-                key=lambda x: x[1],
-                reverse=True,
+            risk_scores = item.get(
+                "risk_category_scores",
+                {},
             )
 
-            categories = [
-                category
-                for category, score in ordered
-                if score > 0
-            ]
+            if risk_scores:
 
-            print(
-                "Risk categories: "
-                + ", ".join(
-                    categories
+                ordered = sorted(
+                    risk_scores.items(),
+                    key=lambda x: x[1],
+                    reverse=True,
                 )
-            )
+
+                categories = [
+                    category
+                    for category, score in ordered
+                    if score > 0
+                ]
+
+                print(
+                    "Risk categories: "
+                    + ", ".join(
+                        categories
+                    )
+                )
 
 
 def print_risk_evidence(
@@ -2783,6 +3601,47 @@ def print_risk_evidence(
         )
 
 
+def print_fact_evidence(
+    fact_evidence: List[dict],
+) -> None:
+
+    print(
+        "\n" + "=" * 60
+    )
+
+    print(
+        "FACT-SPECIFIC EVIDENCE"
+    )
+
+    print(
+        "=" * 60
+    )
+
+    for number, item in enumerate(
+        fact_evidence,
+        start=1,
+    ):
+
+        print()
+
+        print(
+            f"{number}. Chunk {item['chunk_id']}"
+        )
+
+        print(
+            f"Fact score: "
+            f"{item['score']:.4f}"
+        )
+
+        print(
+            "Evidence:"
+        )
+
+        print(
+            item["evidence"]
+        )
+
+
 def print_source_summary(
     selected: List[dict],
 ) -> None:
@@ -2809,7 +3668,7 @@ def print_source_summary(
             f"section_chunk="
             f"{chunk.get('section_chunk')} | "
             f"final="
-            f"{item['final_score']:.4f}"
+            f"{item.get('final_score', 0):.4f}"
         )
 
 
@@ -2937,7 +3796,6 @@ def main() -> None:
             break
 
         if not question:
-
             continue
 
         if question.lower() in {
@@ -2969,18 +3827,33 @@ def main() -> None:
                 selected
             )
 
-            # Build risk evidence once for diagnostics.
-
-            risk_evidence = build_risk_evidence(
-                question=question,
-                selected=selected,
-                topics=topics,
-                max_findings=MAX_RISK_FINDINGS,
+            question_type = detect_question_type(
+                question
             )
 
-            print_risk_evidence(
-                risk_evidence
-            )
+            if question_type == "fact":
+
+                fact_evidence = build_fact_evidence(
+                    question=question,
+                    selected=selected,
+                )
+
+                print_fact_evidence(
+                    fact_evidence
+                )
+
+            else:
+
+                risk_evidence = build_risk_evidence(
+                    question=question,
+                    selected=selected,
+                    topics=topics,
+                    max_findings=MAX_RISK_FINDINGS,
+                )
+
+                print_risk_evidence(
+                    risk_evidence
+                )
 
             print(
                 "\n" + "=" * 60

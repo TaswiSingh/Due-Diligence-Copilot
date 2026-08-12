@@ -1,0 +1,8 @@
+services:
+  app:
+    build: .
+    ports:
+      - "8501:8501"
+    environment:
+      OLLAMA_BASE_URL: "http://host.docker.internal:11434"
+      LLM_MODEL: "llama3.2:3b"
