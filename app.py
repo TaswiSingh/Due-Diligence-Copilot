@@ -19,7 +19,6 @@ if str(SRC_DIR) not in sys.path:
 from retrieve import (
     load_chunks,
     load_embeddings,
-    check_ollama,
     retrieve,
     analyze_question,
 )
@@ -92,7 +91,7 @@ st.sidebar.markdown(
 2. Semantic retrieval
 3. Risk classification
 4. Evidence extraction
-5. Local LLM analysis
+5. Evidence-grounded analysis
 6. Citation validation
 """
 )
@@ -100,7 +99,7 @@ st.sidebar.markdown(
 st.sidebar.divider()
 
 st.sidebar.caption(
-    "Local model: llama3.2:3b"
+    "LLM: optional; deterministic fallback enabled"
 )
 
 st.sidebar.caption(
@@ -155,17 +154,7 @@ if st.button(
                 embedding_model = load_embedding_model()
 
 
-            # ------------------------------------------------
-            # Check Ollama
-            # ------------------------------------------------
-
-            with st.spinner(
-                "Checking local LLM..."
-            ):
-
-                check_ollama()
-
-
+          
             # ------------------------------------------------
             # Retrieval
             # ------------------------------------------------
